@@ -1,4 +1,3 @@
-
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -29,7 +28,18 @@ logging.basicConfig(
     handlers=[_log_handler, logging.StreamHandler()]
 )
 
-APPLIED_JOBS_FILE = 'applied_jobs.json'
+APPLIED_JOBS_FILE  = 'applied_jobs.json'
+OUTCOMES_LOG_FILE  = 'outcomes.csv'
+
+
+def _init_outcomes_log():
+    """Create outcomes CSV with header if it doesn't exist."""
+    if not os.path.exists(OUTCOMES_LOG_FILE):
+        with open(OUTCOMES_LOG_FILE, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow([
+                'timestamp', 'job_title', 'company', 'url',
+                'result', 'questions_answered'
+            ])
 
 
 class NaukriAgent:
@@ -55,6 +65,20 @@ class NaukriAgent:
 
         # Persist applied jobs across restarts to avoid re-applying
         self.applied_job_urls = self._load_applied_jobs()
+
+        # Initialize outcomes log CSV
+        _init_outcomes_log()
+
+    def _log_outcome(self, job_title, company, url, result, q_answered=0):
+        """Append one row to the outcomes CSV."""
+        try:
+            with open(OUTCOMES_LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow([
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    job_title, company, url, result, q_answered
+                ])
+        except Exception as e:
+            logging.warning(f"Could not write outcome log: {e}")
 
     # ================================================================
     # Applied-job persistence helpers
@@ -321,7 +345,9 @@ class NaukriAgent:
             urls.append(
                 f"https://www.naukri.com/{kw_slug}-jobs"
                 f"?k={kw_encoded}"
-                f"&experience=4"
+                f"&experience={max(0, exp - 1)},{exp + 2}"
+                f"&jobAge=3"
+                f"&sort=1"
             )
 
         return urls
@@ -428,14 +454,91 @@ class NaukriAgent:
 
         return None
 
+    def _get_job_context(self):
+        """Return a short job context string for AI prompts."""
+        parts = []
+        if self.current_job_title:
+            parts.append(f"Job: {self.current_job_title}")
+        try:
+            company_name, _ = self.extract_company_info()
+            if company_name and company_name != "Unknown":
+                parts.append(f"Company: {company_name}")
+        except Exception:
+            pass
+        return " | ".join(parts) if parts else None
+
+    def _extract_question_from_sidebar(self, sidebar, inp):
+        """
+        Try multiple strategies to find the question text for a given input element.
+        Returns the best question string found, or empty string.
+        """
+        question = ""
+
+        # Strategy 1: label[@for] matching input id
+        try:
+            field_id = inp.get_attribute('id')
+            if field_id:
+                label = sidebar.find_element(By.XPATH, f".//label[@for='{field_id}']")
+                if label.text.strip():
+                    return label.text.strip()
+        except Exception:
+            pass
+
+        # Strategy 2: aria-label attribute
+        question = inp.get_attribute('aria-label') or ""
+        if question.strip():
+            return question.strip()
+
+        # Strategy 3: placeholder
+        question = inp.get_attribute('placeholder') or ""
+        if question.strip():
+            return question.strip()
+
+        # Strategy 4: nearest preceding sibling / parent text
+        try:
+            parent = inp.find_element(By.XPATH, "./ancestor::div[contains(@class,'question') or "
+                                                "contains(@class,'field') or contains(@class,'form')][1]")
+            texts = [t.strip() for t in parent.text.split('\n')
+                     if t.strip() and len(t.strip()) > 3
+                     and not any(s in t.lower() for s in ['submit', 'save', 'next', 'skip'])]
+            if texts:
+                return texts[0]
+        except Exception:
+            pass
+
+        # Strategy 5: all visible text in sidebar, reversed (most recent question last)
+        try:
+            all_text_elems = sidebar.find_elements(By.XPATH,
+                ".//*[not(self::script) and not(self::style) and "
+                "not(self::input) and not(self::textarea)]"
+            )
+            sidebar_texts = []
+            for te in all_text_elems:
+                try:
+                    t = te.text.strip()
+                    if t and 3 < len(t) < 200:
+                        sidebar_texts.append(t)
+                except Exception:
+                    pass
+            skip_texts = ['save', 'submit', 'next', 'skip', 'type message', 'type here', 'send']
+            for text in reversed(sidebar_texts):
+                if not any(s in text.lower() for s in skip_texts):
+                    return text
+        except Exception:
+            pass
+
+        return "field"
+
     def fill_current_question(self, sidebar):
         """
         Fill ALL fields visible in the CURRENT question only.
+        Now passes field_type and options to AI for smarter answers.
         Returns True if any field was filled.
         """
-        filled_any = False
+        filled_any  = False
+        job_context = self._get_job_context()
 
-        # Diagnostic dump
+        # Diagnostic dump (debug only — comment out in production to speed up)
         try:
             sidebar_html = sidebar.get_attribute('innerHTML')
             logging.info(f"    SIDEBAR HTML (first 1500 chars): {sidebar_html[:1500]}")
@@ -503,69 +606,29 @@ class NaukriAgent:
                     if current_value and len(current_value) > 0:
                         continue
 
-                    # Detect the question text
-                    question = ""
+                    # Determine field type from HTML attribute
+                    raw_type   = inp.get_attribute('type') or 'text'
+                    field_type = 'number' if raw_type == 'number' else 'text'
+                    tag        = inp.tag_name.lower()
+                    if tag == 'textarea':
+                        field_type = 'textarea'
 
-                    try:
-                        all_text_elems = sidebar.find_elements(By.XPATH,
-                            ".//*[not(self::script) and not(self::style) and "
-                            "not(self::input) and not(self::textarea)]"
-                        )
-                        sidebar_texts = []
-                        for te in all_text_elems:
-                            try:
-                                t = te.text.strip()
-                                if t and 3 < len(t) < 200:
-                                    sidebar_texts.append(t)
-                            except Exception:
-                                pass
-                        if sidebar_texts:
-                            skip_texts = ['save', 'submit', 'next', 'skip', 'type message', 'type here']
-                            for text in reversed(sidebar_texts):
-                                if not any(s in text.lower() for s in skip_texts):
-                                    question = text
-                                    logging.info(f"    Chatbot question detected: '{question[:50]}'")
-                                    break
-                    except Exception:
-                        pass
-
-                    if not question:
-                        try:
-                            field_id = inp.get_attribute('id')
-                            if field_id:
-                                label    = sidebar.find_element(By.XPATH, f".//label[@for='{field_id}']")
-                                question = label.text
-                        except Exception:
-                            pass
-
-                    placeholder = inp.get_attribute('placeholder') or ""
-                    if not question and placeholder:
-                        question = placeholder
-
-                    if not question:
-                        question = inp.get_attribute('aria-label') or ""
-
-                    if not question:
-                        try:
-                            parent   = inp.find_element(By.XPATH, "./..")
-                            question = parent.text.strip()
-                        except Exception:
-                            pass
-
-                    if not question:
-                        question = "field"
+                    # Extract question intelligently
+                    question = self._extract_question_from_sidebar(sidebar, inp)
 
                     if any(x in question.lower() for x in ['search', 'filter', 'keyword']):
                         continue
 
-                    answer = self.ai_agent.answer_question(question)
+                    answer = self.ai_agent.answer_question(
+                        question, field_type=field_type, job_context=job_context
+                    )
 
                     self.driver.execute_script(
                         "arguments[0].scrollIntoView({block: 'center'});", inp
                     )
-                    time.sleep(0.5)
+                    time.sleep(0.3)
 
-                    logging.info(f"    Attempting to fill '{question[:30]}...' with '{answer}'")
+                    logging.info(f"    Filling ({field_type}) '{question[:30]}' → '{answer}'")
 
                     fill_success = False
                     try:
@@ -575,11 +638,12 @@ class NaukriAgent:
                         fill_success = True
                         logging.info(f"    ✓ Filled (Standard): {answer}")
                     except Exception as e:
-                        logging.warning(f"      Standard fill failed: {str(e)}")
+                        logging.warning(f"      Standard fill failed: {str(e)[:60]}")
 
                     if not fill_success:
                         try:
-                            self.driver.execute_script(f"arguments[0].value = '{answer}';", inp)
+                            safe_answer = answer.replace("'", "\\'")
+                            self.driver.execute_script(f"arguments[0].value = '{safe_answer}';", inp)
                             self.driver.execute_script("""
                                 arguments[0].dispatchEvent(new Event('input',  { bubbles: true }));
                                 arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
@@ -588,15 +652,15 @@ class NaukriAgent:
                             fill_success = True
                             logging.info(f"    ✓ Filled (JS): {answer}")
                         except Exception as e:
-                            logging.warning(f"      JS fill failed: {str(e)}")
+                            logging.warning(f"      JS fill failed: {str(e)[:60]}")
 
                     if fill_success:
                         filled_any = True
                         self.questions_answered += 1
-                        time.sleep(0.5)
+                        time.sleep(0.3)
 
                 except Exception as e:
-                    logging.error(f"    Error processing input: {str(e)}")
+                    logging.error(f"    Error processing input: {str(e)[:80]}")
                     continue
 
         except Exception as e:
@@ -661,31 +725,75 @@ class NaukriAgent:
         except Exception as e:
             logging.error(f"    Error processing text options: {str(e)}")
 
-        # ---- TRADITIONAL RADIO BUTTONS (fallback) ----
+        # ---- TRADITIONAL RADIO BUTTONS — AI-driven ----
         if not filled_any:
             try:
                 radios = sidebar.find_elements(By.XPATH, ".//input[@type='radio']")
-                for radio in radios:
-                    try:
-                        radio_id = radio.get_attribute('id')
-                        label    = None
-                        if radio_id:
-                            try:
-                                label = sidebar.find_element(By.XPATH, f".//label[@for='{radio_id}']")
-                            except Exception:
-                                pass
-                        if not label:
-                            try:
-                                label = radio.find_element(By.XPATH, "./..")
-                            except Exception:
-                                pass
-                        if label and any(x in label.text.lower() for x in ['yes', 'agree', 'willing']):
-                            self.driver.execute_script("arguments[0].click();", radio)
-                            logging.info("    ✓ Selected YES via radio input")
-                            filled_any = True
-                            time.sleep(0.2)
-                    except Exception:
-                        pass
+                if radios:
+                    # Group radios by name to find distinct questions
+                    radio_groups = {}
+                    for radio in radios:
+                        name = radio.get_attribute('name') or 'default'
+                        radio_groups.setdefault(name, []).append(radio)
+
+                    for name, group in radio_groups.items():
+                        try:
+                            # Collect option labels
+                            option_labels = []
+                            radio_label_map = {}
+                            for radio in group:
+                                radio_id = radio.get_attribute('id')
+                                label_text = ""
+                                if radio_id:
+                                    try:
+                                        lbl = sidebar.find_element(By.XPATH, f".//label[@for='{radio_id}']")
+                                        label_text = lbl.text.strip()
+                                    except Exception:
+                                        pass
+                                if not label_text:
+                                    try:
+                                        label_text = radio.find_element(By.XPATH, "./..").text.strip()
+                                    except Exception:
+                                        pass
+                                if label_text:
+                                    option_labels.append(label_text)
+                                    radio_label_map[label_text] = radio
+
+                            if not option_labels:
+                                # Fallback: click first "yes/agree" radio
+                                for radio in group:
+                                    try:
+                                        parent_text = radio.find_element(By.XPATH, "./..").text.lower()
+                                        if any(x in parent_text for x in ['yes', 'agree', 'willing']):
+                                            self.driver.execute_script("arguments[0].click();", radio)
+                                            filled_any = True
+                                            break
+                                    except Exception:
+                                        pass
+                                continue
+
+                            # Get question context for this radio group
+                            question = self._extract_question_from_sidebar(sidebar, group[0])
+                            best = self.ai_agent.answer_question(
+                                question, field_type='radio',
+                                options=option_labels, job_context=job_context
+                            )
+
+                            # Find and click the matching radio
+                            matched_radio = self.ai_agent._match_to_options(best, option_labels)
+                            if matched_radio in radio_label_map:
+                                self.driver.execute_script(
+                                    "arguments[0].click();", radio_label_map[matched_radio]
+                                )
+                                logging.info(f"    ✓ Radio selected: '{matched_radio}' for '{question[:30]}'")
+                                filled_any = True
+                            else:
+                                # Default: first option in group
+                                self.driver.execute_script("arguments[0].click();", group[0])
+                                logging.info(f"    ✓ Radio fallback: '{option_labels[0]}'")
+                                filled_any = True
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -711,33 +819,32 @@ class NaukriAgent:
                     if len(options) <= 1:
                         continue
 
-                    ctx      = (dropdown.get_attribute('id') or '' + dropdown.get_attribute('name') or '').lower()
-                    selected = False
+                    option_texts = [o.text.strip() for o in options if o.text.strip()]
 
-                    if 'notice' in ctx or 'joining' in ctx:
-                        for opt in options:
-                            if '30' in opt.text.lower() and 'day' in opt.text.lower():
-                                try:
-                                    select.select_by_visible_text(opt.text)
-                                    logging.info(f"    ✓ Selected: {opt.text}")
-                                    selected  = True
-                                    filled_any = True
-                                    break
-                                except Exception:
-                                    pass
+                    # Get label for this dropdown
+                    dropdown_label = self._extract_question_from_sidebar(sidebar, dropdown)
 
-                    if not selected:
+                    # Ask AI / smart picker
+                    best_option = self.ai_agent.pick_dropdown_option(
+                        dropdown_label, option_texts, job_context=job_context
+                    )
+
+                    if best_option:
                         try:
-                            if any(w in options[0].text.lower() for w in ['select', 'choose', '--', 'please']):
-                                select.select_by_index(1)
-                                logging.info(f"    ✓ Selected: {options[1].text}")
-                            else:
-                                select.select_by_index(0)
-                                logging.info(f"    ✓ Selected: {options[0].text}")
+                            select.select_by_visible_text(best_option)
+                            logging.info(f"    ✓ Dropdown selected: '{best_option}' for '{dropdown_label[:30]}'")
                             filled_any = True
                         except Exception:
-                            pass
-
+                            # Fallback: pick first non-placeholder option
+                            for opt in options:
+                                if not any(p in opt.text.lower() for p in ['select', 'choose', '---', 'please']):
+                                    try:
+                                        select.select_by_visible_text(opt.text)
+                                        logging.info(f"    ✓ Dropdown fallback: '{opt.text}'")
+                                        filled_any = True
+                                        break
+                                    except Exception:
+                                        pass
                     time.sleep(0.3)
                 except Exception:
                     continue
@@ -866,7 +973,7 @@ class NaukriAgent:
             if not is_visible:
                 return False
             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-            time.sleep(0.5)
+            time.sleep(0.3)
             try:
                 btn.click()
                 return True
@@ -1115,8 +1222,7 @@ class NaukriAgent:
 
             is_external, external_url, job_details = self.detect_external_apply()
             if is_external:
-                logging.info(f"  ⏭️  External apply detected: {job_details['domain']} — saving for manual review")
-                self.save_external_apply_link(job_details)
+                logging.info(f"  ⏭️  External apply detected: {job_details['domain']} — skipping")
                 self.external_apply += 1
                 return 'skip'
 
@@ -1173,6 +1279,7 @@ class NaukriAgent:
                     lambda d: (
                         self.find_sidebar_container() is not None
                         or 'naukri.com' not in d.current_url
+                        or len(d.window_handles) > 1
                         or len(d.find_elements(By.XPATH,
                             "//div[contains(@class,'drawer')] | //div[@role='dialog']")) > 0
                     )
@@ -1180,12 +1287,15 @@ class NaukriAgent:
             except TimeoutException:
                 time.sleep(1)
 
+            if len(self.driver.window_handles) > 1:
+                logging.info("  ⏭️  Apply opened a new tab/window (external site) — skipping")
+                self.external_apply += 1
+                return 'skip'
+
             is_external_after, _, ext_details = self.detect_external_apply()
             if is_external_after:
-                logging.info("  ⏭️  External redirect after Apply — saving for manual review")
-                if ext_details:
-                    self.save_external_apply_link(ext_details)
-                    self.external_apply += 1
+                logging.info("  ⏭️  External redirect after Apply — skipping")
+                self.external_apply += 1
                 return 'skip'
 
             # Reset the resume upload tracker for this specific job session
@@ -1250,6 +1360,7 @@ class NaukriAgent:
         if job_id and job_id in self.applied_job_urls:
             logging.info(f"  ⏭️  Already applied (cached): {title[:40]}")
             self.already_applied += 1
+            self._log_outcome(title, company, href, 'already_applied')
             return 'already_applied', company
 
         logging.info(f"\nProcessing: {title[:55]} @ {company}")
@@ -1275,6 +1386,11 @@ class NaukriAgent:
                 if job_id:
                     self.applied_job_urls.add(job_id)
                     self._save_applied_jobs()
+                self._log_outcome(title, company, href, 'applied', self.questions_answered)
+            elif result in ('skip', 'external'):
+                self._log_outcome(title, company, href, 'external')
+            elif result == 'failed':
+                self._log_outcome(title, company, href, 'failed')
 
             # Close any extra tabs that may have opened
             self.close_extra_tabs()
@@ -1284,6 +1400,7 @@ class NaukriAgent:
             logging.error(f"Job error: {str(e)}")
             self.close_extra_tabs()
             self.failed += 1
+            self._log_outcome(title, company, href, 'error')
             return 'failed', company
 
     # ================================================================
@@ -1323,12 +1440,12 @@ class NaukriAgent:
 
             if next_btn:
                 self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
-                time.sleep(0.5)
+                time.sleep(0.3)
                 try:
                     next_btn.click()
                 except Exception:
                     self.driver.execute_script("arguments[0].click();", next_btn)
-                time.sleep(3)
+                time.sleep(2)
                 return True
 
             logging.warning(f"Could not find 'Next' button or page {current_page + 1}")
@@ -1494,7 +1611,7 @@ class NaukriAgent:
             print(f"{'='*70}")
             print(f"✅ Direct Applications:  {self.applied}")
             print(f"⏭️  Already Applied:      {self.already_applied}")
-            print(f"🔗 External (saved):     {self.external_apply}")
+            print(f"⏭️  External (skipped):   {self.external_apply}")
             print(f"❌ Failed:               {self.failed}")
             print(f"📝 Questions Answered:   {self.questions_answered}")
             print(f"{'='*70}\n")
